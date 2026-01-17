@@ -188,6 +188,9 @@ class ChatterboxMultilingualTTS:
             original_s3gen_inference = s3gen.inference if hasattr(s3gen, 'inference') else None
 
             try:
+                # Set TensorFloat32 precision for better performance on modern GPUs
+                torch.set_float32_matmul_precision('high')
+
                 # Configure torch._dynamo if available
                 try:
                     from torch import _dynamo
@@ -202,7 +205,7 @@ class ChatterboxMultilingualTTS:
                 if hasattr(t3, 'inference') and callable(t3.inference):
                     t3.inference = torch.compile(
                         t3.inference,
-                        mode="reduce-overhead",
+                        mode="default",
                         fullgraph=False,
                         dynamic=True
                     )
@@ -212,7 +215,7 @@ class ChatterboxMultilingualTTS:
                 if hasattr(s3gen, 'inference') and callable(s3gen.inference):
                     s3gen.inference = torch.compile(
                         s3gen.inference,
-                        mode="reduce-overhead",
+                        mode="default",
                         fullgraph=False,
                         dynamic=True
                     )
