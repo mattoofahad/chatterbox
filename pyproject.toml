@@ -27,6 +27,7 @@ dependencies = [
     # "safetensors==0.5.3",
     "spacy-pkuseg",
     "pykakasi==2.3.0",
+    "peft",
     # "gradio==5.44.1",
 ]
 
@@ -40,7 +41,7 @@ Homepage = "https://github.com/resemble-ai/chatterbox"
 Repository = "https://github.com/resemble-ai/chatterbox"
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0,<81"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
