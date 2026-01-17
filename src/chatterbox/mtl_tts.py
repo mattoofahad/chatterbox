@@ -180,12 +180,16 @@ class ChatterboxMultilingualTTS:
 
         # Apply torch.compile to inference methods for better performance
         # Requires PyTorch 2.0+ with torch.compile support
-        if hasattr(torch, 'compile'):  # type: ignore
+        compile_available = hasattr(torch, 'compile')
+        if compile_available:
             try:
-                import torch._dynamo  # type: ignore
-                # Configure for partial compilation
-                torch._dynamo.config.suppress_errors = True  # type: ignore
-                torch._dynamo.config.verbose = False  # type: ignore
+                # Configure torch._dynamo if available
+                try:
+                    from torch import _dynamo
+                    _dynamo.config.suppress_errors = True
+                    _dynamo.config.verbose = False
+                except (ImportError, AttributeError):
+                    pass  # torch._dynamo not available, continue anyway
 
                 print("⚡ Compiling inference methods with torch.compile...")
 
