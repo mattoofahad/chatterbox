@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import traceback
 
 import librosa
 import torch
@@ -182,6 +183,10 @@ class ChatterboxMultilingualTTS:
         # Requires PyTorch 2.0+ with torch.compile support
         compile_available = hasattr(torch, 'compile')
         if compile_available:
+            # Store original methods in case compilation fails
+            original_t3_inference = t3.inference if hasattr(t3, 'inference') else None
+            original_s3gen_inference = s3gen.inference if hasattr(s3gen, 'inference') else None
+
             try:
                 # Configure torch._dynamo if available
                 try:
@@ -216,7 +221,19 @@ class ChatterboxMultilingualTTS:
                 print("✓ torch.compile optimizations applied successfully!")
 
             except Exception as compile_error:
-                print(f"⚠️ torch.compile failed: {compile_error}")
+                print(f"⚠️ torch.compile failed with error: {compile_error}")
+                print("   Detailed traceback:")
+                print(traceback.format_exc())
+
+                # Restore original methods
+                if original_t3_inference is not None:
+                    t3.inference = original_t3_inference
+                    print("  ↺ T3 inference restored to original (non-compiled) version")
+
+                if original_s3gen_inference is not None:
+                    s3gen.inference = original_s3gen_inference
+                    print("  ↺ S3Gen inference restored to original (non-compiled) version")
+
                 print("   Continuing without torch.compile optimizations")
         else:
             print("ℹ️ torch.compile not available (requires PyTorch 2.0+)")
