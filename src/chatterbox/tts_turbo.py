@@ -1,23 +1,29 @@
+import os
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 import librosa
 import torch
 import perth
-import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
+import pyloudnorm as ln
+
 from safetensors.torch import load_file
+from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
 
 from .models.t3 import T3
-from .models.s3tokenizer import S3_SR, drop_invalid_tokens
+from .models.s3tokenizer import S3_SR
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
+from .models.t3.modules.t3_config import T3Config
+from .models.s3gen.const import S3GEN_SIL
+import logging
+logger = logging.getLogger(__name__)
 
-
-REPO_ID = "ResembleAI/chatterbox"
+REPO_ID = "ResembleAI/chatterbox-turbo"
 
 
 def punc_norm(text: str) -> str:
@@ -37,11 +43,8 @@ def punc_norm(text: str) -> str:
 
     # Replace uncommon/llm punc
     punc_to_replace = [
-        ("...", ", "),
         ("…", ", "),
         (":", ","),
-        (" - ", ", "),
-        (";", ", "),
         ("—", "-"),
         ("–", "-"),
         (" ,", ","),
@@ -104,8 +107,8 @@ class Conditionals:
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
 
-class ChatterboxTTS:
-    ENC_COND_LEN = 6 * S3_SR
+class ChatterboxTurboTTS:
+    ENC_COND_LEN = 15 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
 
     def __init__(
@@ -127,7 +130,7 @@ class ChatterboxTTS:
         self.watermarker = perth.PerthImplicitWatermarker()
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
+    def from_local(cls, ckpt_dir, device) -> 'ChatterboxTurboTTS':
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
@@ -142,31 +145,45 @@ class ChatterboxTTS:
         )
         ve.to(device).eval()
 
-        t3 = T3()
-        t3_state = load_file(ckpt_dir / "t3_cfg.safetensors")
+        # Turbo specific hp
+        hp = T3Config(text_tokens_dict_size=50276)
+        hp.llama_config_name = "GPT2_medium"
+        hp.speech_tokens_dict_size = 6563
+        hp.input_pos_emb = None
+        hp.speech_cond_prompt_len = 375
+        hp.use_perceiver_resampler = False
+        hp.emotion_adv = False
+
+        t3 = T3(hp)
+        t3_state = load_file(ckpt_dir / "t3_turbo_v1.safetensors")
         if "model" in t3_state.keys():
             t3_state = t3_state["model"][0]
         t3.load_state_dict(t3_state)
+        del t3.tfmr.wte
         t3.to(device).eval()
 
-        s3gen = S3Gen()
+        s3gen = S3Gen(meanflow=True)
+        weights = load_file(ckpt_dir / "s3gen_meanflow.safetensors")
         s3gen.load_state_dict(
-            load_file(ckpt_dir / "s3gen.safetensors"), strict=False
+            weights, strict=True
         )
         s3gen.to(device).eval()
 
-        tokenizer = EnTokenizer(
-            str(ckpt_dir / "tokenizer.json")
-        )
+        tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        if len(tokenizer) != 50276:
+            print(f"WARNING: Tokenizer len {len(tokenizer)} != 50276")
 
         conds = None
-        if (builtin_voice := ckpt_dir / "conds.pt").exists():
+        builtin_voice = ckpt_dir / "conds.pt"
+        if builtin_voice.exists():
             conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
     @classmethod
-    def from_pretrained(cls, device, **kwargs) -> 'ChatterboxTTS':
+    def from_pretrained(cls, device, **kwargs) -> 'ChatterboxTurboTTS':
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
@@ -174,20 +191,43 @@ class ChatterboxTTS:
             else:
                 print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
             device = "cpu"
-                # Check if model_snapshot_path is provided in kwargs
+
+        # Check if model_snapshot_path is provided in kwargs
         if 'model_snapshot_path' in kwargs:
             model_snapshot_path = Path(kwargs['model_snapshot_path'])
             if model_snapshot_path.exists():
                 return cls.from_local(ckpt_dir=model_snapshot_path, device=device)
 
-        for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
-            local_path = hf_hub_download(repo_id=REPO_ID, filename=fpath)
+        local_path = snapshot_download(
+            repo_id=REPO_ID,
+            token=os.getenv("HF_TOKEN") or True,
+            # Optional: Filter to download only what you need
+            allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"]
+        )
 
-        return cls.from_local(Path(local_path).parent, device)
+        return cls.from_local(local_path, device)
 
-    def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
-        ## Load reference wav
+    def norm_loudness(self, wav, sr, target_lufs=-27):
+        try:
+            meter = ln.Meter(sr)
+            loudness = meter.integrated_loudness(wav)
+            gain_db = target_lufs - loudness
+            gain_linear = 10.0 ** (gain_db / 20.0)
+            if math.isfinite(gain_linear) and gain_linear > 0.0:
+                wav = wav * gain_linear
+        except Exception as e:
+            print(f"Warning: Error in norm_loudness, skipping: {e}")
+
+        return wav
+
+    def prepare_conditionals(self, wav_fpath, exaggeration=0.5, norm_loudness=True):
+        ## Load and norm reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+
+        assert len(s3gen_ref_wav) / _sr > 5.0, "Audio prompt must be longer than 5 seconds!"
+
+        if norm_loudness:
+            s3gen_ref_wav = self.norm_loudness(s3gen_ref_wav, _sr)
 
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
@@ -207,99 +247,56 @@ class ChatterboxTTS:
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=ve_embed.dtype),
+            emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
     def generate(
         self,
         text,
-        language_id=None, # for API compatibility; not used in this model
-        audio_prompt_path=None,
-        exaggeration=0.5,
-        cfg_weight=0.5,
-        temperature=0.8,
-        # cache optimization params
-        max_new_tokens=1000, 
-        max_cache_len=1500, # Affects the T3 speed, hence important
-        # t3 sampling params
         repetition_penalty=1.2,
-        min_p=0.05,
-        top_p=1.0,
-        t3_params={},
+        min_p=0.00,
+        top_p=0.95,
+        audio_prompt_path=None,
+        exaggeration=0.0,
+        cfg_weight=0.0,
+        temperature=0.8,
+        top_k=1000,
+        norm_loudness=True,
     ):
         if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
-        # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond: T3Cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
-            ).to(device=self.device)
+        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
+            logger.warning("CFG, min_p and exaggeration are not supported by Turbo version and will be ignored.")
 
         # Norm and tokenize text
         text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = text_tokens.input_ids.to(self.device)
 
-        if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+        speech_tokens = self.t3.inference_turbo(
+            t3_cond=self.conds.t3,
+            text_tokens=text_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
 
-        sot = self.t3.hp.start_text_token
-        eot = self.t3.hp.stop_text_token
-        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        # Remove OOV tokens and add silence to end
+        speech_tokens = speech_tokens[speech_tokens < 6561]
+        speech_tokens = speech_tokens.to(self.device)
+        silence = torch.tensor([S3GEN_SIL, S3GEN_SIL, S3GEN_SIL]).long().to(self.device)
+        speech_tokens = torch.cat([speech_tokens, silence])
 
-        with torch.inference_mode():
-            speech_tokens = self.t3.inference(
-                t3_cond=self.conds.t3,
-                text_tokens=text_tokens,
-                max_new_tokens=max_new_tokens,  # TODO: use the value in config
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                max_cache_len=max_cache_len,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-                **t3_params,
-            )
-
-            
-            def speech_to_wav(speech_tokens):
-                # Extract only the conditional batch.
-                speech_tokens = speech_tokens[0]
-
-                # TODO: output becomes 1D
-                speech_tokens = drop_invalid_tokens(speech_tokens)
-                
-                def drop_bad_tokens(tokens):
-                    # Use torch.where instead of boolean indexing to avoid sync
-                    mask = tokens < 6561
-                    # Count valid tokens without transferring to CPU
-                    valid_count = torch.sum(mask).item()
-                    # Create output tensor of the right size
-                    result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
-                    # Use torch.masked_select which is more CUDA-friendly
-                    result = torch.masked_select(tokens, mask)
-                    return result
-
-                # speech_tokens = speech_tokens[speech_tokens < 6561]
-                speech_tokens = drop_bad_tokens(speech_tokens)
-                import time
-                start = time.time()
-                wav, _ = self.s3gen.inference(
-                    speech_tokens=speech_tokens,
-                    ref_dict=self.conds.gen,
-                )
-                end = time.time()
-                print(f"S3Gen inference time: {end - start:.2f} seconds")
-                wav = wav.squeeze(0).detach().cpu().numpy()
-                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-                return torch.from_numpy(watermarked_wav).unsqueeze(0)
-
-            return speech_to_wav(speech_tokens)
-
+        wav, _ = self.s3gen.inference(
+            speech_tokens=speech_tokens,
+            ref_dict=self.conds.gen,
+            n_cfm_timesteps=2,
+        )
+        wav = wav.squeeze(0).detach().cpu().numpy()
+        watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+        return torch.from_numpy(watermarked_wav).unsqueeze(0)

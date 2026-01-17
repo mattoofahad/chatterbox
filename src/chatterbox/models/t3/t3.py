@@ -50,11 +50,20 @@ class T3(nn.Module):
 
     def __init__(self, hp=None):
         if hp is None:
-            hp = T3Config.english_only()  # Default to English-only config for backward compatibility
+            hp = T3Config.english_only()
         super().__init__()
         self.hp = hp
-        self.cfg = LlamaConfig(**LLAMA_CONFIGS[hp.llama_config_name])
-        self.tfmr = LlamaModel(self.cfg)
+
+        config_dict = LLAMA_CONFIGS[hp.llama_config_name]
+        self.is_gpt = config_dict.get("model_type") == "gpt2"
+
+        if self.is_gpt:
+            self.cfg = GPT2Config(**config_dict)
+            self.tfmr = GPT2Model(self.cfg)
+        else:
+            self.cfg = LlamaConfig(**config_dict)
+            self.tfmr = LlamaModel(self.cfg)
+
         self.dim = self.cfg.hidden_size
         self.deepspeed_patch_applied = False
 
@@ -64,6 +73,8 @@ class T3(nn.Module):
         self.speech_emb = nn.Embedding(hp.speech_tokens_dict_size, self.dim)
 
         # custom position embedding
+        self.text_pos_emb = None
+        self.speech_pos_emb = None
         if hp.input_pos_emb == "learned":
             max_text_seq_len = hp.max_text_tokens + 2
             self.text_pos_emb = LearnedPositionEmbeddings(max_text_seq_len, self.dim)
@@ -73,7 +84,7 @@ class T3(nn.Module):
 
         # logit projection
         self.text_head = nn.Linear(self.cfg.hidden_size, hp.text_tokens_dict_size, bias=False)
-        self.speech_head = nn.Linear(self.cfg.hidden_size, hp.speech_tokens_dict_size, bias=False)
+        self.speech_head = nn.Linear(self.cfg.hidden_size, hp.speech_tokens_dict_size, bias=self.is_gpt)
         self.compiled = False
         self.init_processors()
 
@@ -98,8 +109,9 @@ class T3(nn.Module):
         Token cond data needs to be embedded, so that needs to be here instead of in `T3CondEnc`.
         """
         if t3_cond.cond_prompt_speech_tokens is not None and t3_cond.cond_prompt_speech_emb is None:
-            t3_cond.cond_prompt_speech_emb = self.speech_emb(t3_cond.cond_prompt_speech_tokens) + \
-                self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
+            t3_cond.cond_prompt_speech_emb = self.speech_emb(t3_cond.cond_prompt_speech_tokens)
+            if not self.is_gpt:
+                t3_cond.cond_prompt_speech_emb += self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
         return self.cond_enc(t3_cond)  # (B, len_cond, dim)
 
     def prepare_input_embeds(
@@ -115,7 +127,7 @@ class T3(nn.Module):
         # prepare input embeddings (skip backbone tranformer embeddings)
         cond_emb = self.prepare_conditioning(t3_cond)  # (B, len_cond, dim)
         text_emb = self.text_emb(text_tokens)  # (B, len_text, dim)
-        if cfg_weight > 0.0:
+        if cfg_weight > 0.0 and not self.is_gpt:
             text_emb[1].zero_()  # CFG uncond
 
         speech_emb = self.speech_emb(speech_tokens)  # (B, len_speech, dim)
