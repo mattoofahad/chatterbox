@@ -10,7 +10,6 @@ from diffusers.models.attention import (
     ApproximateGELU,
 )
 from diffusers.models.attention_processor import Attention
-from diffusers.models.lora import LoRACompatibleLinear
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 
 
@@ -44,17 +43,17 @@ class SnakeBeta(nn.Module):
             alpha will be trained along with the rest of your model.
         """
         super().__init__()
-        self.in_features = out_features if isinstance(out_features, list) else [out_features]
-        self.proj = LoRACompatibleLinear(in_features, out_features)
+        self.out_features = out_features
+        self.proj = nn.Linear(in_features, out_features)
 
         # initialize alpha
         self.alpha_logscale = alpha_logscale
         if self.alpha_logscale:  # log scale alphas initialized to zeros
-            self.alpha = nn.Parameter(torch.zeros(self.in_features) * alpha)
-            self.beta = nn.Parameter(torch.zeros(self.in_features) * alpha)
+            self.alpha = nn.Parameter(torch.zeros(out_features) * alpha)
+            self.beta = nn.Parameter(torch.zeros(out_features) * alpha)
         else:  # linear scale alphas initialized to ones
-            self.alpha = nn.Parameter(torch.ones(self.in_features) * alpha)
-            self.beta = nn.Parameter(torch.ones(self.in_features) * alpha)
+            self.alpha = nn.Parameter(torch.ones(out_features) * alpha)
+            self.beta = nn.Parameter(torch.ones(out_features) * alpha)
 
         self.alpha.requires_grad = alpha_trainable
         self.beta.requires_grad = alpha_trainable
@@ -123,7 +122,7 @@ class FeedForward(nn.Module):
         # project dropout
         self.net.append(nn.Dropout(dropout))
         # project out
-        self.net.append(LoRACompatibleLinear(inner_dim, dim_out))
+        self.net.append(nn.Linear(inner_dim, dim_out))
         # FF as used in Vision Transformer, MLP-Mixer, etc. have a final dropout
         if final_dropout:
             self.net.append(nn.Dropout(dropout))
