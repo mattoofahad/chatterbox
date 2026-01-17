@@ -159,6 +159,18 @@ class ChatterboxMultilingualTTS:
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(ckpt_dir)
 
+        # Apply GPU/CUDA optimizations if on CUDA device
+        if str(device) == 'cuda' or (hasattr(device, 'type') and device.type == 'cuda'):
+            print("⚡ Applying GPU/CUDA optimizations in chatterbox library...")
+            # Enable TF32 for better performance on Ampere+ GPUs
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # Enable CUDNN benchmarking
+            torch.backends.cudnn.benchmark = True
+            # Set float32 precision to high
+            torch.set_float32_matmul_precision('high')
+            print("  ✓ TF32, CUDNN benchmark, and matmul precision optimizations enabled")
+
         ve = VoiceEncoder()
         ve.load_state_dict(
             torch.load(ckpt_dir / "ve.pt", weights_only=True)
