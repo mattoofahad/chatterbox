@@ -179,38 +179,43 @@ class ChatterboxMultilingualTTS:
         s3gen.to(device).eval()
 
         # Apply torch.compile to inference methods for better performance
-        try:
-            import torch._dynamo
-            # Configure for partial compilation
-            torch._dynamo.config.suppress_errors = True
-            torch._dynamo.config.verbose = False
+        # Requires PyTorch 2.0+ with torch.compile support
+        if hasattr(torch, 'compile'):  # type: ignore
+            try:
+                import torch._dynamo  # type: ignore
+                # Configure for partial compilation
+                torch._dynamo.config.suppress_errors = True  # type: ignore
+                torch._dynamo.config.verbose = False  # type: ignore
 
-            print("⚡ Compiling inference methods with torch.compile...")
+                print("⚡ Compiling inference methods with torch.compile...")
 
-            # Compile T3 inference method
-            if hasattr(t3, 'inference') and callable(t3.inference):
-                t3.inference = torch.compile(
-                    t3.inference,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                    dynamic=True
-                )
-                print("  ✓ T3 inference method compiled")
+                # Compile T3 inference method
+                if hasattr(t3, 'inference') and callable(t3.inference):
+                    t3.inference = torch.compile(
+                        t3.inference,
+                        mode="reduce-overhead",
+                        fullgraph=False,
+                        dynamic=True
+                    )
+                    print("  ✓ T3 inference method compiled")
 
-            # Compile S3Gen inference method
-            if hasattr(s3gen, 'inference') and callable(s3gen.inference):
-                s3gen.inference = torch.compile(
-                    s3gen.inference,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                    dynamic=True
-                )
-                print("  ✓ S3Gen inference method compiled")
+                # Compile S3Gen inference method
+                if hasattr(s3gen, 'inference') and callable(s3gen.inference):
+                    s3gen.inference = torch.compile(
+                        s3gen.inference,
+                        mode="reduce-overhead",
+                        fullgraph=False,
+                        dynamic=True
+                    )
+                    print("  ✓ S3Gen inference method compiled")
 
-            print("✓ torch.compile optimizations applied successfully!")
+                print("✓ torch.compile optimizations applied successfully!")
 
-        except Exception as compile_error:
-            print(f"⚠️ torch.compile failed: {compile_error}")
+            except Exception as compile_error:
+                print(f"⚠️ torch.compile failed: {compile_error}")
+                print("   Continuing without torch.compile optimizations")
+        else:
+            print("ℹ️ torch.compile not available (requires PyTorch 2.0+)")
             print("   Continuing without torch.compile optimizations")
 
         tokenizer = MTLTokenizer(
