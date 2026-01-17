@@ -159,17 +159,33 @@ class ChatterboxMultilingualTTS:
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(ckpt_dir)
 
-        # Apply GPU/CUDA optimizations if on CUDA device
-        if str(device) == 'cuda' or (hasattr(device, 'type') and device.type == 'cuda'):
+        # Apply GPU/CUDA optimizations if enabled via environment variable
+        # Note: These optimizations can sometimes hurt performance depending on GPU/workload
+        # Enable with: CHATTERBOX_ENABLE_GPU_OPTS=true
+        enable_gpu_opts = os.getenv('CHATTERBOX_ENABLE_GPU_OPTS', 'false').lower() == 'true'
+
+        if enable_gpu_opts and (str(device) == 'cuda' or (hasattr(device, 'type') and device.type == 'cuda')):
             print("⚡ Applying GPU/CUDA optimizations in chatterbox library...")
+
             # Enable TF32 for better performance on Ampere+ GPUs
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+            if os.getenv('CHATTERBOX_ENABLE_TF32', 'true').lower() == 'true':
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                print("  ✓ TF32 enabled")
+
             # Enable CUDNN benchmarking
-            torch.backends.cudnn.benchmark = True
+            if os.getenv('CHATTERBOX_ENABLE_CUDNN_BENCHMARK', 'true').lower() == 'true':
+                torch.backends.cudnn.benchmark = True
+                print("  ✓ CUDNN benchmarking enabled")
+
             # Set float32 precision to high
-            torch.set_float32_matmul_precision('high')
-            print("  ✓ TF32, CUDNN benchmark, and matmul precision optimizations enabled")
+            if os.getenv('CHATTERBOX_ENABLE_HIGH_PRECISION', 'true').lower() == 'true':
+                torch.set_float32_matmul_precision('high')
+                print("  ✓ High precision matmul enabled")
+
+            print("✓ GPU/CUDA optimizations applied")
+        elif enable_gpu_opts:
+            print(f"ℹ️ GPU optimizations requested but device is {device}, skipping")
 
         ve = VoiceEncoder()
         ve.load_state_dict(
